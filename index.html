@@ -1,0 +1,796 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Süper Zıplayan — Mario Tarzı Platform Oyunu</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html,body { width:100%; height:100%; overflow:hidden; background:#000; touch-action:none; overscroll-behavior:none;
+    font-family:"Courier New",monospace; user-select:none; -webkit-user-select:none; }
+  #wrap { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; }
+  canvas { image-rendering:pixelated; image-rendering:crisp-edges; background:#5C94FC; }
+  #touch { position:fixed; inset:0; pointer-events:none; z-index:10; display:none; }
+  .pad { position:absolute; bottom:max(18px, env(safe-area-inset-bottom)); display:flex; gap:14px; pointer-events:none; }
+  .pad.left { left:max(18px, env(safe-area-inset-left)); }
+  .pad.right { right:max(18px, env(safe-area-inset-right)); }
+  .btn { pointer-events:auto; width:64px; height:64px; border-radius:50%; border:2px solid rgba(255,255,255,.7);
+    background:rgba(0,0,0,.35); color:#fff; font-size:22px; font-weight:bold; display:flex; align-items:center;
+    justify-content:center; touch-action:none; -webkit-user-select:none; user-select:none; }
+  .btn:active, .btn.on { background:rgba(255,255,255,.35); }
+  #btnA { width:76px; height:76px; background:rgba(220,40,40,.5); }
+  #btnB { width:60px; height:60px; background:rgba(40,90,220,.5); }
+  #mute { position:fixed; top:max(10px, env(safe-area-inset-top)); right:10px; z-index:20; width:40px; height:40px;
+    border-radius:8px; border:2px solid rgba(255,255,255,.6); background:rgba(0,0,0,.4); color:#fff; font-size:18px; }
+  #fs { position:fixed; top:max(10px, env(safe-area-inset-top)); right:58px; z-index:20; width:40px; height:40px;
+    border-radius:8px; border:2px solid rgba(255,255,255,.6); background:rgba(0,0,0,.4); color:#fff; font-size:16px; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="game" width="416" height="240"></canvas></div>
+<div id="touch">
+  <div class="pad left">
+    <div class="btn" id="btnL">◀</div>
+    <div class="btn" id="btnR">▶</div>
+  </div>
+  <div class="pad right">
+    <div class="btn" id="btnB">B</div>
+    <div class="btn" id="btnA">A</div>
+  </div>
+</div>
+<button id="fs">⛶</button>
+<button id="mute">🔊</button>
+<script>
+"use strict";
+// ================= TEMEL AYARLAR =================
+const TILE = 16, VW = 416, VH = 240, ROWS = 15;
+const cv = document.getElementById("game");
+const ctx = cv.getContext("2d");
+ctx.imageSmoothingEnabled = false;
+
+const SOLID = "#B?MUXp";
+function fitScreen(){
+  const s = Math.min(innerWidth / VW, innerHeight / VH);
+  cv.style.width  = Math.floor(VW * s) + "px";
+  cv.style.height = Math.floor(VH * s) + "px";
+}
+addEventListener("resize", fitScreen); fitScreen();
+
+const isTouch = ("ontouchstart" in window) || navigator.maxTouchPoints > 0;
+if (isTouch) document.getElementById("touch").style.display = "block";
+
+// ================= SES =================
+let AC = null, master = null, muted = false;
+function audio(){
+  if (!AC){
+    AC = new (window.AudioContext || window.webkitAudioContext)();
+    master = AC.createGain(); master.gain.value = 0.4; master.connect(AC.destination);
+  }
+  if (AC.state === "suspended") AC.resume();
+}
+function beep(f0, f1, dur, type = "square", vol = 0.22, when = 0){
+  if (muted || !AC) return;
+  const t = AC.currentTime + when;
+  const o = AC.createOscillator(), g = AC.createGain();
+  o.type = type;
+  o.frequency.setValueAtTime(f0, t);
+  if (f1 !== f0) o.frequency.exponentialRampToValueAtTime(Math.max(20, f1), t + dur);
+  g.gain.setValueAtTime(vol, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+  o.connect(g); g.connect(master);
+  o.start(t); o.stop(t + dur + 0.05);
+}
+const midi2f = m => 440 * Math.pow(2, (m - 69) / 12);
+const SFX = {
+  jump(){ beep(300, 700, 0.18); },
+  coin(){ beep(988, 988, 0.07, "square", 0.2); beep(1319, 1319, 0.3, "square", 0.2, 0.07); },
+  stomp(){ beep(500, 90, 0.12, "square", 0.25); },
+  bump(){ beep(140, 70, 0.1, "square", 0.25); },
+  brick(){ beep(220, 50, 0.2, "sawtooth", 0.25); },
+  power(){ [523,659,784,1047,1319,1568].forEach((f,i)=>beep(f,f,0.09,"square",0.2,i*0.07)); },
+  shrink(){ beep(700, 150, 0.35, "square", 0.22); },
+  die(){ [660,622,587,523,440,330,262].forEach((f,i)=>beep(f,f,0.14,"triangle",0.25,i*0.12)); },
+  flag(){ [523,587,659,784,880,1047,1319].forEach((f,i)=>beep(f,f,0.12,"square",0.2,i*0.09)); },
+  oneUp(){ [784,1047,1319,1568].forEach((f,i)=>beep(f,f,0.1,"square",0.2,i*0.08)); }
+};
+// arka plan müziği (özgün, kısa chiptune döngüsü)
+const MEL  = [72,76,79,76, 81,79,76,72, 74,77,81,77, 79,77,74,71,
+              72,76,79,76, 81,79,76,79, 81,81,79,77, 76,74,72,0];
+const BASS = [48,0,55,0, 45,0,52,0, 50,0,57,0, 43,0,50,0,
+              48,0,55,0, 45,0,52,0, 45,0,50,0, 43,0,48,0];
+let musIdx = 0, musNext = 0;
+function musicTick(){
+  if (muted || !AC || !(state === "play")) return;
+  const now = AC.currentTime;
+  if (musNext < now) musNext = now + 0.05;
+  while (musNext < now + 0.25){
+    const m = MEL[musIdx], b = BASS[musIdx >> 1];
+    if (m) beep(midi2f(m), midi2f(m), 0.13, "square", 0.06, musNext - now);
+    if (b) beep(midi2f(b), midi2f(b), 0.28, "triangle", 0.08, musNext - now);
+    musNext += 0.155;
+    musIdx = (musIdx + 1) % MEL.length;
+  }
+}
+document.getElementById("mute").addEventListener("click", e => {
+  muted = !muted;
+  e.currentTarget.textContent = muted ? "🔇" : "🔊";
+  if (!muted){ audio(); musNext = 0; }
+});
+document.getElementById("fs").addEventListener("click", () => {
+  if (document.fullscreenElement) document.exitFullscreen();
+  else document.documentElement.requestFullscreen && document.documentElement.requestFullscreen();
+});
+
+// ================= GİRDİ =================
+const input = { left:false, right:false, jump:false, run:false };
+let jumpPressed = false;
+function pressJump(){ if (!input.jump) jumpPressed = true; input.jump = true; }
+addEventListener("keydown", e => {
+  if (["ArrowLeft","ArrowRight","ArrowUp","ArrowDown"," "].includes(e.key)) e.preventDefault();
+  audio();
+  if (e.key === "ArrowLeft"  || e.key === "a" || e.key === "A") input.left = true;
+  if (e.key === "ArrowRight" || e.key === "d" || e.key === "D") input.right = true;
+  if (e.key === "ArrowUp" || e.key === " " || e.key === "w" || e.key === "W" || e.key === "z") pressJump();
+  if (e.key === "Shift" || e.key === "x" || e.key === "X") input.run = true;
+  if (e.key === "Enter" || e.key === " ") actionKey();
+});
+addEventListener("keyup", e => {
+  if (e.key === "ArrowLeft"  || e.key === "a" || e.key === "A") input.left = false;
+  if (e.key === "ArrowRight" || e.key === "d" || e.key === "D") input.right = false;
+  if (e.key === "ArrowUp" || e.key === " " || e.key === "w" || e.key === "W" || e.key === "z") input.jump = false;
+  if (e.key === "Shift" || e.key === "x" || e.key === "X") input.run = false;
+});
+function bindBtn(id, down, up){
+  const el = document.getElementById(id);
+  el.addEventListener("pointerdown", e => { e.preventDefault(); el.setPointerCapture(e.pointerId); audio(); down(); el.classList.add("on"); });
+  const rel = e => { up(); el.classList.remove("on"); };
+  el.addEventListener("pointerup", rel);
+  el.addEventListener("pointercancel", rel);
+  el.addEventListener("lostpointercapture", rel);
+}
+bindBtn("btnL", () => input.left = true,  () => input.left = false);
+bindBtn("btnR", () => input.right = true, () => input.right = false);
+bindBtn("btnB", () => input.run = true,   () => input.run = false);
+bindBtn("btnA", () => pressJump(),        () => input.jump = false);
+cv.addEventListener("pointerdown", () => { audio(); actionKey(); });
+document.body.addEventListener("touchmove", e => e.preventDefault(), { passive:false });
+
+function actionKey(){
+  if (state === "title")   startGame();
+  else if (state === "gameover" || state === "complete"){ state = "title"; }
+}
+
+// ================= SEVİYE KURUCU =================
+function buildLevel(w, fn){
+  const rows = [];
+  for (let y = 0; y < ROWS; y++) rows.push(new Array(w).fill(" "));
+  const g = (x, y, c) => { if (x >= 0 && x < w && y >= 0 && y < ROWS) rows[y][x] = c; };
+  const ground = (x0, x1) => { for (let x = x0; x <= x1; x++){ g(x, 13, "#"); g(x, 14, "#"); } };
+  const gap    = (x0, x1) => { for (let x = x0; x <= x1; x++){ g(x, 13, " "); g(x, 14, " "); } };
+  const pipe   = (x, h)   => { for (let i = 0; i < h; i++){ g(x, 12 - i, "p"); g(x + 1, 12 - i, "p"); } };
+  const stairUp   = (x, h) => { for (let i = 0; i < h; i++) for (let j = 0; j <= i; j++) g(x + i, 12 - j, "X"); };
+  const stairDown = (x, h) => { for (let i = 0; i < h; i++) for (let j = 0; j < h - i; j++) g(x + i, 12 - j, "X"); };
+  const row    = (x, y, s) => { for (let i = 0; i < s.length; i++) if (s[i] !== ".") g(x + i, y, s[i]); };
+  fn({ g, ground, gap, pipe, stairUp, stairDown, row });
+  return rows.map(r => r.join(""));
+}
+
+const LEVEL_DEFS = [
+  { world: "1-1", w: 214, build(a){
+      const { ground, gap, pipe, stairUp, stairDown, row, g } = a;
+      ground(0, 68); gap(69, 70); ground(71, 85); gap(86, 88);
+      ground(89, 152); gap(153, 155); ground(156, 213);
+      g(16, 9, "?");
+      row(20, 9, "B?B?B"); g(22, 6, "?"); g(23, 6, "M");
+      pipe(28, 2); pipe(38, 3); pipe(46, 4); pipe(57, 4);
+      row(64, 9, "BB");
+      g(21, 12, "g"); g(40, 12, "g"); g(51, 12, "g"); g(52, 12, "g");
+      g(80, 12, "g");
+      row(77, 6, "BMB");
+      g(97, 12, "g"); g(98, 12, "g");
+      g(94, 9, "?"); g(95, 9, "?");
+      row(100, 6, "BBBB"); row(101, 8, "ooo");
+      row(106, 9, "B?B");
+      g(112, 12, "r"); g(113, 12, "g");
+      row(118, 6, "BoB");
+      g(121, 12, "g"); g(122, 12, "g");
+      row(126, 9, "ooo");
+      stairUp(134, 4); stairDown(138, 4);
+      g(147, 12, "r"); g(148, 12, "g");
+      g(160, 9, "M"); row(163, 9, "BB?BB");
+      g(168, 12, "g"); g(169, 12, "g"); g(170, 12, "g");
+      pipe(174, 2);
+      row(178, 6, "B?B");
+      stairUp(181, 8);
+      for (let y = 4; y <= 12; y++) g(197, y, "F");
+    } },
+  { world: "1-2", w: 220, build(a){
+      const { ground, gap, pipe, stairUp, stairDown, row, g } = a;
+      ground(0, 30); gap(31, 33); ground(34, 52); gap(53, 56);
+      ground(57, 90); gap(91, 93); ground(94, 120); gap(121, 124);
+      ground(125, 158); gap(159, 161); ground(162, 219);
+      row(10, 9, "B?B"); g(11, 6, "M");
+      pipe(16, 3); pipe(24, 4);
+      g(14, 12, "g"); g(26, 12, "g"); g(27, 12, "g");
+      row(38, 6, "BoB?BoB"); row(39, 9, "o.o");
+      g(44, 12, "r"); g(48, 12, "g");
+      g(62, 9, "?"); g(63, 9, "?"); g(64, 9, "?");
+      pipe(70, 2); pipe(76, 4); pipe(83, 5);
+      g(66, 12, "g"); g(80, 12, "r"); g(86, 12, "g"); g(87, 12, "g");
+      row(98, 9, "BB"); row(102, 6, "B?BMB"); row(103, 12, "g");
+      g(110, 12, "r"); g(111, 12, "g"); g(112, 12, "r");
+      row(116, 9, "ooo.ooo");
+      stairUp(130, 3); stairDown(133, 3);
+      g(140, 12, "g"); g(141, 12, "g"); g(142, 12, "g"); g(143, 12, "g");
+      row(146, 9, "B?B"); row(150, 6, "BB?BB");
+      pipe(166, 3);
+      g(170, 12, "r"); g(176, 12, "g"); g(177, 12, "g");
+      row(180, 9, "?B?");
+      stairUp(190, 8);
+      for (let y = 4; y <= 12; y++) g(205, y, "F");
+    } }
+];
+
+// ================= OYUN DURUMU =================
+let state = "title";           // title | play | gameover | complete
+let score = 0, coins = 0, lives = 3, time = 300, timeTick = 0;
+let levelIdx = 0;
+let grid = [], levelW = 0, flagX = 0;
+let camX = 0, frame = 0, winTimer = 0, msgTimer = 0;
+let player = null;
+let enemies = [], items = [], effects = [], popups = [];
+
+function loadLevel(i){
+  const def = LEVEL_DEFS[i];
+  grid = buildLevel(def.w, def.build);
+  levelW = def.w;
+  flagX = 0;
+  enemies = []; items = []; effects = []; popups = [];
+  for (let y = 0; y < ROWS; y++){
+    for (let x = 0; x < levelW; x++){
+      const c = grid[y][x];
+      if (c === "g" || c === "r"){
+        enemies.push(makeGoomba(x * TILE + 1, y * TILE + 2, c === "r"));
+        grid[y] = grid[y].substring(0, x) + " " + grid[y].substring(x + 1);
+      }
+      if (c === "F" && !flagX) flagX = x;
+    }
+  }
+  player = {
+    x: 2 * TILE, y: 13 * TILE - 14, w: 12, h: 14, vx: 0, vy: 0,
+    big: false, onGround: false, face: 1, anim: 0, coyote: 0, buffer: 0,
+    dead: false, deadTimer: 0, inv: 0, grew: 0
+  };
+  camX = 0; time = 300; timeTick = 0; winTimer = 0;
+}
+
+function startGame(){
+  score = 0; coins = 0; lives = 3; levelIdx = 0;
+  loadLevel(levelIdx);
+  state = "play";
+  audio(); musNext = 0;
+}
+
+function makeGoomba(x, y, red){
+  return { x, y, w: 14, h: 14, vx: red ? -0.7 : -0.45, vy: 0, red, squash: 0, active: false };
+}
+
+// ================= HARİTA YARDIMCILARI =================
+function tileAt(tx, ty){
+  if (tx < 0 || tx >= levelW) return "#";
+  if (ty < 0 || ty >= ROWS) return " ";
+  return grid[ty][tx];
+}
+function isSolid(tx, ty){ return SOLID.includes(tileAt(tx, ty)); }
+function setTile(tx, ty, c){ if (tx >= 0 && tx < levelW && ty >= 0 && ty < ROWS) grid[ty] = grid[ty].substring(0, tx) + c + grid[ty].substring(tx + 1); }
+
+// ================= ÇARPIŞMA =================
+function collideX(e){
+  const ts = TILE;
+  if (e.vx > 0){
+    const tx = Math.floor((e.x + e.w - 0.01) / ts);
+    for (let ty = Math.floor(e.y / ts); ty <= Math.floor((e.y + e.h - 0.1) / ts); ty++){
+      if (isSolid(tx, ty)){ e.x = tx * ts - e.w; e.vx = 0; e.hitWall = 1; return; }
+    }
+  } else if (e.vx < 0){
+    const tx = Math.floor((e.x + 0.01) / ts);
+    for (let ty = Math.floor(e.y / ts); ty <= Math.floor((e.y + e.h - 0.1) / ts); ty++){
+      if (isSolid(tx, ty)){ e.x = (tx + 1) * ts; e.vx = 0; e.hitWall = -1; return; }
+    }
+  }
+  e.hitWall = 0;
+}
+function collideY(e, isPlayer){
+  const ts = TILE;
+  e.onGround = false;
+  if (e.vy > 0){
+    const ty = Math.floor((e.y + e.h) / ts);
+    for (let tx = Math.floor(e.x / ts); tx <= Math.floor((e.x + e.w - 0.1) / ts); tx++){
+      if (isSolid(tx, ty)){ e.y = ty * ts - e.h; e.vy = 0; e.onGround = true; return; }
+    }
+  } else if (e.vy < 0){
+    const ty = Math.floor(e.y / ts);
+    let bumped = -1, best = 1e9;
+    for (let tx = Math.floor((e.x + 0.01) / ts); tx <= Math.floor((e.x + e.w - 0.01) / ts); tx++){
+      if (isSolid(tx, ty)){
+        const d = Math.abs((tx + 0.5) * ts - (e.x + e.w / 2));
+        if (d < best){ best = d; bumped = tx; }
+      }
+    }
+    if (bumped >= 0){
+      e.y = (ty + 1) * ts; e.vy = 0;
+      if (isPlayer) bumpBlock(bumped, ty);
+    }
+  }
+}
+function bumpBlock(tx, ty){
+  const c = tileAt(tx, ty);
+  if (c === "?"){
+    setTile(tx, ty, "U");
+    spawnCoinPop(tx, ty);
+  } else if (c === "M"){
+    setTile(tx, ty, "U");
+    items.push({ x: tx * TILE + 2, y: ty * TILE, w: 12, h: 12, vx: 0, vy: 0, rise: 16, mushroom: true });
+    SFX.power();
+  } else if (c === "B"){
+    if (player.big){
+      setTile(tx, ty, " ");
+      score += 50;
+      for (let i = 0; i < 4; i++)
+        effects.push({ x: tx * TILE + 4 + (i % 2) * 6, y: ty * TILE + 4 + (i > 1 ? 6 : 0),
+                       vx: (i % 2 ? 1.2 : -1.2), vy: -3 - (i > 1 ? 0 : 1), life: 60, brick: true });
+      SFX.brick();
+    } else SFX.bump();
+    // blok üzerindeki düşmanı devir
+    for (const en of enemies)
+      if (!en.squash && Math.abs(en.x + en.w / 2 - (tx + 0.5) * TILE) < TILE &&
+          Math.abs(en.y + en.h - ty * TILE) < 4){
+        en.squash = 1; en.flip = true; score += 100; popups.push({ x: en.x, y: en.y - 8, t: "+100", life: 40 });
+      }
+  } else SFX.bump();
+}
+function spawnCoinPop(tx, ty){
+  coins++; score += 200;
+  if (coins >= 100){ coins -= 100; lives++; SFX.oneUp(); }
+  effects.push({ x: tx * TILE + 4, y: ty * TILE - 12, vx: 0, vy: -4.5, life: 34, coinPop: true });
+  popups.push({ x: tx * TILE, y: ty * TILE - 14, t: "+200", life: 40 });
+  SFX.coin();
+}
+
+// ================= OYUNCU =================
+function updatePlayer(){
+  const p = player;
+  if (p.dead){
+    p.deadTimer++;
+    if (p.deadTimer > 20){ p.vy += 0.4; p.y += p.vy; }
+    if (p.y > VH + 40){
+      lives--;
+      if (lives <= 0) state = "gameover";
+      else { loadLevel(levelIdx); state = "play"; }
+    }
+    return;
+  }
+  if (state === "play" && flagX && p.x + p.w > flagX * TILE - 4){
+    state = "win"; winTimer = 0; SFX.flag();
+    score += Math.max(0, Math.floor(time)) * 50;
+  }
+  if (state === "win"){
+    winTimer++;
+    p.vx = 0;
+    if (p.onGround && winTimer > 30){
+      p.vx = 1.2; p.face = 1;
+      if (winTimer > 160){
+        levelIdx++;
+        if (levelIdx >= LEVEL_DEFS.length){ state = "complete"; return; }
+        loadLevel(levelIdx); state = "play";
+      }
+    }
+  } else {
+    const acc = p.onGround ? (input.run ? 0.18 : 0.12) : 0.09;
+    const maxSpd = input.run ? 2.9 : 1.6;
+    if (input.left)  { p.vx -= acc; p.face = -1; }
+    if (input.right) { p.vx += acc; p.face = 1; }
+    if (!input.left && !input.right && p.onGround) p.vx *= 0.82;
+    p.vx = Math.max(-maxSpd, Math.min(maxSpd, p.vx));
+    if (p.onGround) p.coyote = 6; else if (p.coyote > 0) p.coyote--;
+    if (jumpPressed) p.buffer = 8;
+    if (p.buffer > 0){
+      p.buffer--;
+      if (p.coyote > 0){
+        p.vy = -(7.0 + Math.min(Math.abs(p.vx), 2.9) * 0.45);
+        p.coyote = 0; p.buffer = 0; p.onGround = false;
+        SFX.jump();
+      }
+    }
+    if (!input.jump && p.vy < -2.6) p.vy = -2.6;
+  }
+  p.vy += 0.38;
+  if (p.vy > 7) p.vy = 7;
+  p.grew = Math.max(0, p.grew - 1);
+  p.inv = Math.max(0, p.inv - 1);
+  p.x += p.vx; collideX(p);
+  if (p.x < camX + 1) { p.x = camX + 1; if (p.vx < 0) p.vx = 0; }
+  p.y += p.vy; collideY(p, true);
+
+  if (p.anim < 20) p.anim++;
+  const moving = Math.abs(p.vx) > 0.2;
+  if (moving && p.onGround) p.anim += Math.abs(p.vx) * 0.35;
+
+  coinTiles(p);
+  hurtEnemies(p);
+
+  if (p.y > VH + 20 && !p.dead) killPlayer(true);
+  const target = p.x - VW * 0.42;
+  camX = Math.max(0, Math.min(levelW * TILE - VW, camX + (Math.max(target, camX) - camX) * 0.5));
+}
+function coinTiles(p){
+  for (let ty = Math.floor(p.y / TILE); ty <= Math.floor((p.y + p.h - 1) / TILE); ty++)
+    for (let tx = Math.floor(p.x / TILE); tx <= Math.floor((p.x + p.w - 1) / TILE); tx++)
+      if (tileAt(tx, ty) === "o"){
+        setTile(tx, ty, " ");
+        coins++; score += 100;
+        if (coins >= 100){ coins -= 100; lives++; SFX.oneUp(); }
+        SFX.coin();
+      }
+}
+function hurtEnemies(p){
+  for (const en of enemies){
+    if (en.squash || en.flip) continue;
+    if (p.x < en.x + en.w && p.x + p.w > en.x && p.y < en.y + en.h && p.y + p.h > en.y){
+      if (p.vy > 0.5 && p.y + p.h - en.y < 9){
+        en.squash = 26;
+        score += 100;
+        popups.push({ x: en.x, y: en.y - 8, t: "+100", life: 40 });
+        p.vy = input.jump ? -7.4 : -4.6;
+        SFX.stomp();
+      } else if (p.inv <= 0){
+        if (p.big){
+          p.big = false; const feet = p.y + p.h;
+          p.h = 14; p.y = feet - 14; p.inv = 100; p.grew = 20;
+          SFX.shrink();
+        } else killPlayer(false);
+      }
+    }
+  }
+}
+function killPlayer(fell){
+  const p = player;
+  if (p.dead) return;
+  p.dead = true; p.deadTimer = 0; p.vy = fell ? 0 : -8; p.vx = 0;
+  SFX.die();
+}
+
+// ================= DÜŞMAN VE EŞYALAR =================
+function updateEnemies(){
+  for (const en of enemies){
+    if (en.x - camX < VW + 40 && en.x - camX > -60) en.active = true;
+    if (!en.active) continue;
+    if (en.squash > 0 && !en.flip){
+      en.squash--;
+      continue;
+    }
+    if (en.flip){
+      en.vy += 0.4; en.y += en.vy;
+      continue;
+    }
+    en.vy += 0.38; if (en.vy > 7) en.vy = 7;
+    en.x += en.vx; collideX(en);
+    if (en.hitWall) en.vx = -en.vx || (en.red ? -0.7 : -0.45);
+    en.y += en.vy; collideY(en, false);
+    if (en.y > VH + 30) en.gone = true;
+  }
+  enemies = enemies.filter(e => !e.gone && (!e.flip || e.y < VH + 40));
+}
+function updateItems(){
+  for (const it of items){
+    if (it.rise > 0){ it.y -= 0.4; it.rise -= 0.4; if (it.rise <= 0) it.vx = 0.9; continue; }
+    it.vy += 0.3; if (it.vy > 6) it.vy = 6;
+    it.x += it.vx; collideX(it);
+    if (it.hitWall) it.vx = -it.vx || 0.9;
+    it.y += it.vy; collideY(it, false);
+    if (it.y > VH + 30) it.gone = true;
+    const p = player;
+    if (!p.dead && p.x < it.x + it.w && p.x + p.w > it.x && p.y < it.y + it.h && p.y + p.h > it.y){
+      it.gone = true; score += 1000;
+      popups.push({ x: it.x, y: it.y - 8, t: "+1000", life: 50 });
+      if (!p.big){
+        const feet = p.y + p.h;
+        p.big = true; p.h = 30; p.y = feet - 30; p.grew = 20;
+      }
+      SFX.power();
+    }
+  }
+  items = items.filter(i => !i.gone);
+}
+function updateEffects(){
+  for (const e of effects){
+    e.life--;
+    if (e.coinPop || e.brick){ e.vy += 0.3; e.x += e.vx; e.y += e.vy; }
+  }
+  effects = effects.filter(e => e.life > 0);
+  for (const t of popups){ t.life--; t.y -= 0.6; }
+  popups = popups.filter(t => t.life > 0);
+}
+
+// ================= ÇİZİM =================
+function px(x, y, w, h, c){ ctx.fillStyle = c; ctx.fillRect(Math.round(x), Math.round(y), w, h); }
+
+function drawBackground(){
+  ctx.fillStyle = "#5C94FC"; ctx.fillRect(0, 0, VW, VH);
+  // bulutlar (parallax)
+  const co = camX * 0.4;
+  for (let i = 0; i < 10; i++){
+    const cx = ((i * 173 + 40) % (levelW * TILE)) - co;
+    const cy = 30 + (i % 3) * 26;
+    if (cx > -60 && cx < VW + 60){
+      px(cx, cy, 24, 8, "#fff"); px(cx + 6, cy - 6, 14, 8, "#fff"); px(cx + 16, cy - 2, 12, 6, "#fff");
+    }
+  }
+  // tepeler
+  const ho = camX * 0.75;
+  for (let i = 0; i < 14; i++){
+    const hx = ((i * 221 + 90) % (levelW * TILE)) - ho;
+    if (hx > -90 && hx < VW + 90){
+      ctx.fillStyle = "#00A800";
+      ctx.beginPath();
+      ctx.moveTo(hx, 208); ctx.lineTo(hx + 45, 148); ctx.lineTo(hx + 90, 208);
+      ctx.fill();
+    }
+  }
+  // çalılar
+  const bo = camX * 0.9;
+  for (let i = 0; i < 16; i++){
+    const bx = ((i * 147 + 200) % (levelW * TILE)) - bo;
+    if (bx > -70 && bx < VW + 70){
+      px(bx, 196, 44, 12, "#00A800"); px(bx + 8, 190, 14, 8, "#00A800"); px(bx + 26, 190, 14, 8, "#00A800");
+    }
+  }
+  // kale (bayrağın arkasında)
+  if (flagX){
+    const kx = flagX * TILE + 40 - camX, ky = 208;
+    if (kx > -90 && kx < VW){
+      px(kx, ky - 48, 80, 48, "#C84C0C");
+      px(kx + 16, ky - 72, 48, 24, "#C84C0C");
+      px(kx + 26, ky - 30, 16, 30, "#000");
+      for (let i = 0; i < 5; i++){ px(kx + i * 16, ky - 54, 8, 6, "#C84C0C"); px(kx + 18 + i * 9, ky - 78, 6, 6, "#C84C0C"); }
+      px(kx, ky - 48, 80, 4, "#7c2d00"); px(kx + 16, ky - 72, 48, 4, "#7c2d00");
+    }
+  }
+}
+
+function drawTiles(){
+  if (!grid.length) return;
+  const x0 = Math.floor(camX / TILE), x1 = Math.ceil((camX + VW) / TILE);
+  for (let ty = 0; ty < ROWS; ty++){
+    for (let tx = x0; tx <= x1; tx++){
+      const c = tileAt(tx, ty);
+      if (c === " ") continue;
+      const X = tx * TILE - camX, Y = ty * TILE;
+      if (c === "#"){
+        px(X, Y, 16, 16, "#C84C0C");
+        px(X, Y, 16, 3, "#E39D52"); px(X, Y + 13, 16, 3, "#7c2d00");
+        px(X + 4, Y + 5, 3, 3, "#7c2d00"); px(X + 10, Y + 8, 3, 3, "#7c2d00");
+      } else if (c === "B"){
+        px(X, Y, 16, 16, "#9C4A00");
+        px(X, Y + 7, 16, 2, "#000"); px(X, Y + 15, 16, 1, "#000");
+        px(X + 7, Y, 2, 7, "#000"); px(X + 3, Y + 9, 2, 7, "#000"); px(X + 12, Y + 9, 2, 7, "#000");
+        px(X, Y, 16, 2, "#d97b3f");
+      } else if (c === "?" || c === "M"){
+        const glow = Math.floor(frame / 12) % 4;
+        const col = glow === 3 ? "#E39D52" : "#FAC000";
+        px(X, Y, 16, 16, col);
+        px(X, Y, 16, 2, "#ffe9a0"); px(X, Y + 14, 16, 2, "#9c6b00");
+        px(X + 1, Y + 1, 2, 2, "#7c4a00"); px(X + 13, Y + 1, 2, 2, "#7c4a00");
+        px(X + 1, Y + 13, 2, 2, "#7c4a00"); px(X + 13, Y + 13, 2, 2, "#7c4a00");
+        ctx.fillStyle = "#7c4a00"; ctx.font = "bold 10px monospace"; ctx.textAlign = "center";
+        ctx.fillText("?", X + 8, Y + 12);
+      } else if (c === "U"){
+        px(X, Y, 16, 16, "#9C4A00");
+        px(X + 1, Y + 1, 14, 14, "#7c2d00"); px(X + 3, Y + 3, 10, 10, "#9C4A00");
+      } else if (c === "X"){
+        px(X, Y, 16, 16, "#B8B8B8");
+        px(X, Y, 16, 2, "#fff"); px(X, Y + 14, 16, 2, "#555");
+        px(X + 2, Y + 4, 12, 8, "#989898");
+      } else if (c === "p"){
+        const leftOpen = tileAt(tx - 1, ty) !== "p";
+        const topOpen  = tileAt(tx, ty - 1) !== "p";
+        px(X, Y, 16, 16, "#00A800");
+        if (leftOpen) px(X, Y, 4, 16, "#7cff7c"); else px(X + 12, Y, 4, 16, "#005c00");
+        if (topOpen){ px(X - (leftOpen ? 0 : 0), Y, 16, 5, "#7cff7c"); px(X, Y + 5, 16, 2, "#005c00"); px(X, Y, 16, 2, "#baffba"); }
+      } else if (c === "o"){
+        const ph = Math.abs(Math.sin(frame * 0.08));
+        const w = 4 + 8 * ph;
+        px(X + 8 - w / 2, Y + 3, w, 10, "#FAC000");
+        px(X + 8 - w / 2, Y + 3, w, 2, "#fff6c0"); px(X + 8 - w / 2, Y + 11, w, 2, "#9c6b00");
+      } else if (c === "F"){
+        px(X + 7, Y, 2, 16, "#B8B8B8");
+        if (tileAt(tx, ty - 1) !== "F") px(X + 3, Y, 10, 4, "#00A800");
+        const fy = 6 * TILE;
+        if (ty === 6 && state !== "win"){
+          ctx.fillStyle = "#00A800";
+          ctx.beginPath(); ctx.moveTo(X + 9, Y); ctx.lineTo(X + 24, Y + 5); ctx.lineTo(X + 9, Y + 10); ctx.fill();
+        }
+        if (state === "win" && ty === Math.min(12, 6 + Math.floor(winTimer / 6))){
+          ctx.fillStyle = "#00A800";
+          ctx.beginPath(); ctx.moveTo(X + 9, Y); ctx.lineTo(X + 24, Y + 5); ctx.lineTo(X + 9, Y + 10); ctx.fill();
+        }
+      }
+    }
+  }
+}
+
+function drawMario(){
+  const p = player;
+  if (p.inv > 0 && Math.floor(frame / 3) % 2 === 0 && !p.dead) return;
+  const X = Math.round(p.x - camX), Y = Math.round(p.y);
+  const RED = "#E52521", SKIN = "#FFC08A", BLUE = "#2A4BD7", BROWN = "#6B3710", HAIR = "#5a2d00";
+  ctx.save();
+  if (p.face === -1){ ctx.translate(X * 2 + p.w, 0); ctx.scale(-1, 1); }
+  const jumping = !p.onGround;
+  const walkF = Math.floor(p.anim / 6) % 3;
+  if (p.big){
+    px(X + 2, Y, 9, 4, RED);                    // şapka
+    px(X + 1, Y + 2, 3, 3, RED);
+    px(X + 3, Y + 4, 7, 5, SKIN);               // yüz
+    px(X + 8, Y + 5, 2, 2, "#000");             // göz
+    px(X + 2, Y + 4, 2, 3, HAIR);
+    px(X + 9, Y + 6, 2, 2, HAIR);               // bıyık
+    px(X + 2, Y + 9, 8, 6, RED);                // gömlek
+    px(X + 3, Y + 12, 6, 8, BLUE);              // tulum
+    px(X + 5, Y + 13, 2, 2, "#FAC000");         // düğme
+    px(X + 1, Y + 10, 2, 5, RED); px(X + 9, Y + 10, 2, 5, RED); // kollar
+    px(X + 2, Y + 15, 2, 2, SKIN); px(X + 8, Y + 15, 2, 2, SKIN);
+    if (jumping){
+      px(X, Y + 20, 4, 6, BROWN); px(X + 7, Y + 22, 5, 6, BROWN);
+    } else if (walkF === 0){
+      px(X + 2, Y + 20, 3, 8, BROWN); px(X + 7, Y + 20, 3, 8, BROWN);
+    } else if (walkF === 1){
+      px(X + 1, Y + 20, 4, 8, BROWN); px(X + 6, Y + 23, 5, 5, BROWN);
+    } else {
+      px(X + 2, Y + 23, 5, 5, BROWN); px(X + 7, Y + 20, 4, 8, BROWN);
+    }
+  } else {
+    px(X + 2, Y, 9, 3, RED);                    // şapka
+    px(X + 1, Y + 1, 2, 3, RED);
+    px(X + 3, Y + 3, 7, 4, SKIN);               // yüz
+    px(X + 8, Y + 3, 1, 2, "#000");             // göz
+    px(X + 2, Y + 3, 2, 2, HAIR);
+    px(X + 2, Y + 7, 8, 3, RED);                // gömlek
+    px(X + 3, Y + 9, 6, 3, BLUE);               // tulum
+    if (jumping){
+      px(X, Y + 11, 4, 3, BROWN); px(X + 7, Y + 11, 4, 3, BROWN);
+    } else if (walkF === 1){
+      px(X + 1, Y + 12, 4, 2, BROWN); px(X + 7, Y + 12, 4, 2, BROWN);
+    } else {
+      px(X + 2, Y + 12, 3, 2, BROWN); px(X + 7, Y + 12, 3, 2, BROWN);
+    }
+  }
+  ctx.restore();
+}
+
+function drawGoomba(en){
+  const X = Math.round(en.x - camX), Y = Math.round(en.y);
+  if (en.flip){
+    ctx.save(); ctx.translate(X + 7, Y + 7); ctx.scale(1, -1); ctx.translate(-(X + 7), -(Y + 7));
+  }
+  const body = en.red ? "#C00000" : "#8B4513";
+  if (en.squash > 0 && !en.flip){
+    px(X, Y + 10, 14, 4, body);
+  } else {
+    px(X + 1, Y + 2, 12, 8, body);
+    px(X + 3, Y, 8, 3, body);
+    px(X + 2, Y + 4, 4, 4, "#fff"); px(X + 8, Y + 4, 4, 4, "#fff");
+    px(X + 4, Y + 5, 2, 3, "#000"); px(X + 8, Y + 5, 2, 3, "#000");
+    px(X + 1, Y + 3, 3, 2, "#000"); px(X + 10, Y + 3, 3, 2, "#000");
+    const f = Math.floor(frame / 8) % 2;
+    px(X + (f ? 0 : 2), Y + 11, 5, 3, "#5a2d00"); px(X + (f ? 9 : 7), Y + 11, 5, 3, "#5a2d00");
+  }
+  if (en.flip) ctx.restore();
+}
+
+function drawItems(){
+  for (const it of items){
+    const X = Math.round(it.x - camX), Y = Math.round(it.y);
+    px(X, Y + 2, 12, 10, "#F8B800"); px(X + 2, Y, 8, 2, "#F8B800");
+    px(X + 2, Y + 4, 3, 2, "#fff"); px(X + 7, Y + 4, 2, 2, "#fff");
+    px(X + 2, Y + 7, 3, 2, "#fff"); px(X + 7, Y + 7, 2, 2, "#fff");
+    px(X, Y + 2, 12, 1, "#d98e00");
+  }
+  for (const e of effects){
+    const X = Math.round(e.x - camX), Y = Math.round(e.y);
+    if (e.brick) px(X, Y, 6, 6, "#9C4A00");
+    if (e.coinPop){
+      const ph = Math.abs(Math.sin(e.life * 0.3));
+      px(X + 4 - 3 * ph, Y, 6 * ph + 1, 10, "#FAC000");
+    }
+  }
+  for (const t of popups){
+    ctx.fillStyle = "#fff"; ctx.font = "bold 8px monospace"; ctx.textAlign = "left";
+    ctx.fillText(t.t, Math.round(t.x - camX), Math.round(t.y));
+  }
+}
+
+function text(t, x, y, size, col, align){
+  ctx.font = "bold " + size + "px 'Courier New',monospace";
+  ctx.textAlign = align || "left";
+  ctx.fillStyle = "#000"; ctx.fillText(t, x + 1, y + 1);
+  ctx.fillStyle = col || "#fff"; ctx.fillText(t, x, y);
+}
+
+function drawHUD(){
+  text("MARIO", 16, 14, 8); text(String(score).padStart(6, "0"), 16, 24, 8);
+  text("×" + String(coins).padStart(2, "0"), 120, 14, 8, "#FAC000");
+  text("DÜNYA", 200, 14, 8); text(LEVEL_DEFS[levelIdx].world, 210, 24, 8);
+  text("SÜRE", 330, 14, 8); text(String(Math.max(0, Math.ceil(time))), 340, 24, 8);
+  text("♥" + lives, 380, 14, 8, "#ff6060");
+}
+
+function drawCenter(lines){
+  ctx.fillStyle = "rgba(0,0,0,0.55)"; ctx.fillRect(0, 0, VW, VH);
+  lines.forEach((l, i) => text(l.t, VW / 2, 100 + i * 26, l.s || 14, l.c || "#fff", "center"));
+}
+
+function render(){
+  drawBackground();
+  drawTiles();
+  drawItems();
+  for (const en of enemies) drawGoomba(en);
+  if (player) drawMario();
+  drawHUD();
+  if (state === "title"){
+    drawCenter([
+      { t: "SÜPER ZIPLAYAN", s: 26, c: "#FAC000" },
+      { t: "Mario Tarzı Platform Oyunu", s: 11, c: "#9cf" },
+      { t: " ", s: 8 },
+      { t: isTouch ? "Başlamak için ekrana DOKUN" : "Başlamak için SPACE / ENTER", s: 12, c: "#fff" },
+      { t: isTouch ? "◀ ▶ hareket  •  A zıpla  •  B koş" : "← → hareket • Z/SPACE zıpla • X koş", s: 10, c: "#bbb" },
+      { t: "Mantar al → büyü  •  Düşmanlara BAS!", s: 10, c: "#bbb" }
+    ]);
+  } else if (state === "win"){
+    text("SEVİYE TAMAMLANDI!", VW / 2, 80, 16, "#FAC000", "center");
+  } else if (state === "gameover"){
+    drawCenter([
+      { t: "OYUN BİTTİ", s: 24, c: "#ff5050" },
+      { t: "Skor: " + score, s: 14 },
+      { t: isTouch ? "Tekrar için ekrana DOKUN" : "Tekrar için SPACE", s: 12, c: "#bbb" }
+    ]);
+  } else if (state === "complete"){
+    drawCenter([
+      { t: "TEBRİKLER!", s: 24, c: "#FAC000" },
+      { t: "Prenses başka bir kalede :)", s: 12 },
+      { t: "Toplam Skor: " + score, s: 14 },
+      { t: isTouch ? "Baştan için ekrana DOKUN" : "Baştan için SPACE", s: 12, c: "#bbb" }
+    ]);
+  }
+}
+
+// ================= ANA DÖNGÜ =================
+function update(){
+  frame++;
+  if (state === "play"){
+    updatePlayer();
+    updateEnemies();
+    updateItems();
+    updateEffects();
+    if (!player.dead){
+      timeTick++;
+      if (timeTick >= 24){ timeTick = 0; time--; if (time <= 0) killPlayer(false); }
+    }
+  } else if (state === "win"){
+    updatePlayer();
+    updateEnemies();
+    updateEffects();
+  }
+  musicTick();
+}
+function loop(){
+  update();
+  render();
+  jumpPressed = false;
+  requestAnimationFrame(loop);
+}
+loop();
+</script>
+</body>
+</html>
