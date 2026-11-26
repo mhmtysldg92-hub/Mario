@@ -468,6 +468,7 @@ function updateEnemies(){
     if (!en.active) continue;
     if (en.squash > 0 && !en.flip){
       en.squash--;
+      if (en.squash === 0) en.gone = true;
       continue;
     }
     if (en.flip){
